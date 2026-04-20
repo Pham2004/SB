@@ -49,6 +49,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      
       - name: Run RELIC MAS for ${{ matrix.problem }}
         working-directory: ./relic
         env:
@@ -69,6 +70,51 @@ jobs:
             echo "Experiment $exp/$iterations completed"
             echo ""
           done
+      
+      - name: Run Tests for ${{ matrix.problem }}
+        working-directory: ./relic
+        run: |
+          iterations=${{ inputs.iterations || '3' }}
+          for exp in $(seq 1 $iterations); do
+            RESULTS_DIR="results/${{ matrix.problem }}-exp$exp/relic"
+            PROBLEM_DIR="problems/${{ matrix.problem }}"
+            
+            if [ ! -f "$RESULTS_DIR/func_A_best.py" ]; then
+              echo "⚠️  Experiment $exp: No best code found, skipping tests"
+              continue
+            fi
+            
+            echo "=========================================="
+            echo "Testing Experiment $exp: ${{ matrix.problem }}"
+            echo "=========================================="
+            
+            # Copy best code to problem directory for eval.py to use
+            cp "$RESULTS_DIR/func_A_best.py" "$PROBLEM_DIR/func_A.py"
+            cp "$RESULTS_DIR/func_B_best.py" "$PROBLEM_DIR/func_B.py"
+            cp "$RESULTS_DIR/func_C_best.py" "$PROBLEM_DIR/func_C.py"
+            
+            # Test n50
+            echo "Running test on n50..."
+            python "$PROBLEM_DIR/eval.py" \
+              --data "${{ matrix.problem }}_test_n50.npz" \
+              > "$RESULTS_DIR/test_n50.txt" 2>&1
+            
+            # Test n80
+            echo "Running test on n80..."
+            python "$PROBLEM_DIR/eval.py" \
+              --data "${{ matrix.problem }}_test_n80.npz" \
+              > "$RESULTS_DIR/test_n80.txt" 2>&1
+            
+            # Extract and display results
+            echo ""
+            echo "Test n50 Result:"
+            tail -5 "$RESULTS_DIR/test_n50.txt" || echo "No result"
+            echo ""
+            echo "Test n80 Result:"
+            tail -5 "$RESULTS_DIR/test_n80.txt" || echo "No result"
+            echo ""
+          done
+      
       - name: Upload all experiments for ${{ matrix.problem }}
         if: always()
         uses: actions/upload-artifact@v4
@@ -94,6 +140,33 @@ jobs:
             else
               echo "⚠️  Experiment $exp: No summary found (may have been interrupted)"
             fi
+          done
+
+      - name: Display test results for ${{ matrix.problem }}
+        if: always()
+        working-directory: ./relic
+        run: |
+          iterations=${{ inputs.iterations || '3' }}
+          for exp in $(seq 1 $iterations); do
+            test_n50="results/${{ matrix.problem }}-exp$exp/relic/test_n50.txt"
+            test_n80="results/${{ matrix.problem }}-exp$exp/relic/test_n80.txt"
+            
+            echo "========== Test Results Experiment $exp for ${{ matrix.problem }} =========="
+            
+            if [ -f "$test_n50" ]; then
+              echo "--- Test N50 ---"
+              cat "$test_n50"
+            else
+              echo "⚠️  No n50 test results"
+            fi
+            
+            if [ -f "$test_n80" ]; then
+              echo "--- Test N80 ---"
+              cat "$test_n80"
+            else
+              echo "⚠️  No n80 test results"
+            fi
+            echo ""
           done
 
       - name: Capture logs for ${{ matrix.problem }} (even if interrupted)
