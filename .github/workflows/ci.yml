@@ -1,4 +1,4 @@
-name: RELIC MAS Parallel - mapp_ar, mapp_ds, mapp_pc
+name: RELIC MAPP Parallel - mapp_ar, mapp_ds, mapp_pc
 
 on:
   workflow_dispatch:
