@@ -20,7 +20,7 @@ jobs:
       - name: Checkout private RELIC repo
         uses: actions/checkout@v4
         with:
-          repository: USERNAME/RELIC           # ⚠️ sửa thành username/tên repo private của bạn
+          repository: Pham2004/RELIC           # ⚠️ sửa thành username/tên repo private của bạn
           token: ${{ secrets.RELIC_TOKEN }}
           path: relic
           ref: main
