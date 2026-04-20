@@ -24,7 +24,7 @@ jobs:
     strategy:
       matrix:
         problem: [mas_fs, mas_jd, mas_st]
-      max-parallel: 1  # Run sequentially (no rate limit risk)
+      max-parallel: 3  # Run up to 3 problems in parallel
 
     steps:
       - name: Checkout SB repo
@@ -38,10 +38,10 @@ jobs:
           path: relic
           ref: main
 
-      - name: Set up Python 3.10
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
           cache: 'pip'
 
       - name: Install dependencies
