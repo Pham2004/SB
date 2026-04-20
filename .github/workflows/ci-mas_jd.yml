@@ -1,4 +1,4 @@
-name: RELIC MAS Parallel - mapp_ds
+name: RELIC MAS - mas_jd
 
 on:
   workflow_dispatch:
@@ -20,11 +20,6 @@ jobs:
   relic-mas-parallel:
     runs-on: ubuntu-latest
     timeout-minutes: 480
-
-    strategy:
-      matrix:
-        problem: [mapp_ds]
-      max-parallel: 1  # Run up to 1 problem in parallel
 
     steps:
       - name: Checkout SB repo
@@ -50,7 +45,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Run RELIC MAS for ${{ matrix.problem }}
+      - name: Run RELIC MAS for mas_jd
         working-directory: ./relic
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -58,26 +53,26 @@ jobs:
           iterations=${{ inputs.iterations || '3' }}
           for exp in $(seq 1 $iterations); do
             echo "=========================================="
-            echo "Experiment $exp/$iterations: ${{ matrix.problem }}"
+            echo "Experiment $exp/$iterations: mas_jd"
             echo "Budget: ${{ inputs.budget_per_batch || '10' }} per batch"
             echo "=========================================="
-            HYDRA_OUT_DIR="results/${{ matrix.problem }}-exp$exp/relic"
+            HYDRA_OUT_DIR="results/mas_jd-exp$exp/relic"
             mkdir -p "$HYDRA_OUT_DIR"
             python main.py \
-              problem=${{ matrix.problem }} \
+              problem=mas_jd \
               framework.hyperparams.budget_per_batch=${{ inputs.budget_per_batch || '10' }} \
               path.RESULTS="$HYDRA_OUT_DIR"
             echo "Experiment $exp/$iterations completed"
             echo ""
           done
       
-      - name: Run Tests for ${{ matrix.problem }}
+      - name: Run Tests for mas_jd
         working-directory: ./relic
         run: |
           iterations=${{ inputs.iterations || '3' }}
           for exp in $(seq 1 $iterations); do
-            RESULTS_DIR="results/${{ matrix.problem }}-exp$exp/relic"
-            PROBLEM_DIR="problems/${{ matrix.problem }}"
+            RESULTS_DIR="results/mas_jd-exp$exp/relic"
+            PROBLEM_DIR="problems/mas_jd"
             
             if [ ! -f "$RESULTS_DIR/func_A_best.py" ]; then
               echo "⚠️  Experiment $exp: No best code found, skipping tests"
@@ -85,7 +80,7 @@ jobs:
             fi
             
             echo "=========================================="
-            echo "Testing Experiment $exp: ${{ matrix.problem }}"
+            echo "Testing Experiment $exp: mas_jd"
             echo "=========================================="
             
             # Copy best code to problem directory for eval.py to use
@@ -96,13 +91,13 @@ jobs:
             # Test n50
             echo "Running test on n50..."
             python "$PROBLEM_DIR/eval.py" \
-              --data "${{ matrix.problem }}_test_n50.npz" \
+              --data "mas_jd_test_n50.npz" \
               > "$RESULTS_DIR/test_n50.txt" 2>&1
             
             # Test n80
             echo "Running test on n80..."
             python "$PROBLEM_DIR/eval.py" \
-              --data "${{ matrix.problem }}_test_n80.npz" \
+              --data "mas_jd_test_n80.npz" \
               > "$RESULTS_DIR/test_n80.txt" 2>&1
             
             # Extract and display results
@@ -115,26 +110,26 @@ jobs:
             echo ""
           done
       
-      - name: Upload all experiments for ${{ matrix.problem }}
+      - name: Upload all experiments for mas_jd
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: relic-mas-${{ matrix.problem }}-all
+          name: relic-mas-mas_jd-all
           path: |
-            relic/results/${{ matrix.problem }}-exp*/relic/
+            relic/results/mas_jd-exp*/relic/
             relic/outputs/
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Display summary for ${{ matrix.problem }}
+      - name: Display summary for mas_jd
         if: always()
         working-directory: ./relic
         run: |
           iterations=${{ inputs.iterations || '3' }}
           for exp in $(seq 1 $iterations); do
-            summary="results/${{ matrix.problem }}-exp$exp/relic/summary.json"
+            summary="results/mas_jd-exp$exp/relic/summary.json"
             if [ -f "$summary" ]; then
-              echo "========== Summary Experiment $exp for ${{ matrix.problem }} =========="
+              echo "========== Summary Experiment $exp for mas_jd =========="
               python -m json.tool < "$summary" | head -30
               echo ""
             else
@@ -142,16 +137,16 @@ jobs:
             fi
           done
 
-      - name: Display test results for ${{ matrix.problem }}
+      - name: Display test results for mas_jd
         if: always()
         working-directory: ./relic
         run: |
           iterations=${{ inputs.iterations || '3' }}
           for exp in $(seq 1 $iterations); do
-            test_n50="results/${{ matrix.problem }}-exp$exp/relic/test_n50.txt"
-            test_n80="results/${{ matrix.problem }}-exp$exp/relic/test_n80.txt"
+            test_n50="results/mas_jd-exp$exp/relic/test_n50.txt"
+            test_n80="results/mas_jd-exp$exp/relic/test_n80.txt"
             
-            echo "========== Test Results Experiment $exp for ${{ matrix.problem }} =========="
+            echo "========== Test Results Experiment $exp for mas_jd =========="
             
             if [ -f "$test_n50" ]; then
               echo "--- Test N50 ---"
@@ -169,13 +164,13 @@ jobs:
             echo ""
           done
 
-      - name: Capture logs for ${{ matrix.problem }} (even if interrupted)
+      - name: Capture logs for mas_jd (even if interrupted)
         if: always()
         working-directory: ./relic
         run: |
           iterations=${{ inputs.iterations || '3' }}
           for exp in $(seq 1 $iterations); do
-            log_file="results/${{ matrix.problem }}-exp$exp/relic/run_log.jsonl"
+            log_file="results/mas_jd-exp$exp/relic/run_log.jsonl"
             if [ -f "$log_file" ]; then
               log_count=$(wc -l < "$log_file")
               echo "✓ Experiment $exp: Captured $log_count log entries"

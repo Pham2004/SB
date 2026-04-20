@@ -1,0 +1,180 @@
+name: RELIC MAPP - mapp_ds
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Number of runs per problem (default: 3)'
+        required: false
+        default: '3'
+        type: string
+      budget_per_batch:
+        description: 'MCTS budget per batch (higher = better quality, slower)'
+        required: false
+        default: '10'
+        type: string
+  schedule:
+    - cron: '0 2 * * *'
+
+jobs:
+  relic-mas-parallel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+
+    steps:
+      - name: Checkout SB repo
+        uses: actions/checkout@v4
+
+      - name: Checkout private RELIC repo
+        uses: actions/checkout@v4
+        with:
+          repository: Pham2004/RELIC
+          token: ${{ secrets.RELIC_TOKEN }}
+          path: relic
+          ref: main
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: ./relic
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run RELIC MAS for mapp_ds
+        working-directory: ./relic
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          iterations=${{ inputs.iterations || '3' }}
+          for exp in $(seq 1 $iterations); do
+            echo "=========================================="
+            echo "Experiment $exp/$iterations: mapp_ds"
+            echo "Budget: ${{ inputs.budget_per_batch || '10' }} per batch"
+            echo "=========================================="
+            HYDRA_OUT_DIR="results/mapp_ds-exp$exp/relic"
+            mkdir -p "$HYDRA_OUT_DIR"
+            python main.py \
+              problem=mapp_ds \
+              framework.hyperparams.budget_per_batch=${{ inputs.budget_per_batch || '10' }} \
+              path.RESULTS="$HYDRA_OUT_DIR"
+            echo "Experiment $exp/$iterations completed"
+            echo ""
+          done
+      
+      - name: Run Tests for mapp_ds
+        working-directory: ./relic
+        run: |
+          iterations=${{ inputs.iterations || '3' }}
+          for exp in $(seq 1 $iterations); do
+            RESULTS_DIR="results/mapp_ds-exp$exp/relic"
+            PROBLEM_DIR="problems/mapp_ds"
+            
+            if [ ! -f "$RESULTS_DIR/func_A_best.py" ]; then
+              echo "⚠️  Experiment $exp: No best code found, skipping tests"
+              continue
+            fi
+            
+            echo "=========================================="
+            echo "Testing Experiment $exp: mapp_ds"
+            echo "=========================================="
+            
+            # Copy best code to problem directory for eval.py to use
+            cp "$RESULTS_DIR/func_A_best.py" "$PROBLEM_DIR/func_A.py"
+            cp "$RESULTS_DIR/func_B_best.py" "$PROBLEM_DIR/func_B.py"
+            cp "$RESULTS_DIR/func_C_best.py" "$PROBLEM_DIR/func_C.py"
+            
+            # Test n50
+            echo "Running test on n50..."
+            python "$PROBLEM_DIR/eval.py" \
+              --data "mapp_ds_test_n50.npz" \
+              > "$RESULTS_DIR/test_n50.txt" 2>&1
+            
+            # Test n80
+            echo "Running test on n80..."
+            python "$PROBLEM_DIR/eval.py" \
+              --data "mapp_ds_test_n80.npz" \
+              > "$RESULTS_DIR/test_n80.txt" 2>&1
+            
+            # Extract and display results
+            echo ""
+            echo "Test n50 Result:"
+            tail -5 "$RESULTS_DIR/test_n50.txt" || echo "No result"
+            echo ""
+            echo "Test n80 Result:"
+            tail -5 "$RESULTS_DIR/test_n80.txt" || echo "No result"
+            echo ""
+          done
+      
+      - name: Upload all experiments for mapp_ds
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relic-mas-mapp_ds-all
+          path: |
+            relic/results/mapp_ds-exp*/relic/
+            relic/outputs/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Display summary for mapp_ds
+        if: always()
+        working-directory: ./relic
+        run: |
+          iterations=${{ inputs.iterations || '3' }}
+          for exp in $(seq 1 $iterations); do
+            summary="results/mapp_ds-exp$exp/relic/summary.json"
+            if [ -f "$summary" ]; then
+              echo "========== Summary Experiment $exp for mapp_ds =========="
+              python -m json.tool < "$summary" | head -30
+              echo ""
+            else
+              echo "⚠️  Experiment $exp: No summary found (may have been interrupted)"
+            fi
+          done
+
+      - name: Display test results for mapp_ds
+        if: always()
+        working-directory: ./relic
+        run: |
+          iterations=${{ inputs.iterations || '3' }}
+          for exp in $(seq 1 $iterations); do
+            test_n50="results/mapp_ds-exp$exp/relic/test_n50.txt"
+            test_n80="results/mapp_ds-exp$exp/relic/test_n80.txt"
+            
+            echo "========== Test Results Experiment $exp for mapp_ds =========="
+            
+            if [ -f "$test_n50" ]; then
+              echo "--- Test N50 ---"
+              cat "$test_n50"
+            else
+              echo "⚠️  No n50 test results"
+            fi
+            
+            if [ -f "$test_n80" ]; then
+              echo "--- Test N80 ---"
+              cat "$test_n80"
+            else
+              echo "⚠️  No n80 test results"
+            fi
+            echo ""
+          done
+
+      - name: Capture logs for mapp_ds (even if interrupted)
+        if: always()
+        working-directory: ./relic
+        run: |
+          iterations=${{ inputs.iterations || '3' }}
+          for exp in $(seq 1 $iterations); do
+            log_file="results/mapp_ds-exp$exp/relic/run_log.jsonl"
+            if [ -f "$log_file" ]; then
+              log_count=$(wc -l < "$log_file")
+              echo "✓ Experiment $exp: Captured $log_count log entries"
+            else
+              echo "⚠️  Experiment $exp: No run log found (may not have started)"
+            fi
+          done
