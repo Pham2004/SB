@@ -1,4 +1,4 @@
-name: RELIC MAPP Parallel - mapp_ar, mapp_ds, mapp_pc
+name: RELIC MAS Parallel - mas_fs, mas_jd, mas_st
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ jobs:
 
     strategy:
       matrix:
-        problem: [mapp_ar, mapp_ds, mapp_pc]
+        problem: [mas_fs, mas_jd, mas_st]
       max-parallel: 3  # Run up to 3 problems in parallel
 
     steps:
