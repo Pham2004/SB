@@ -5,9 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_dispatch:   # cho phép chạy thủ công từ tab Actions
+  workflow_dispatch:
   schedule:
-    - cron: '0 2 * * *'  # optional: chạy hàng ngày lúc 2h sáng UTC
+    - cron: '0 2 * * *'
 
 jobs:
   build-and-test:
@@ -22,8 +22,8 @@ jobs:
         with:
           repository: USERNAME/RELIC           # ⚠️ sửa thành username/tên repo private của bạn
           token: ${{ secrets.RELIC_TOKEN }}
-          path: relic                          # clone vào thư mục ./relic
-          ref: main                            # hoặc master, tuỳ nhánh của bạn
+          path: relic
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,13 +43,9 @@ jobs:
       - name: Run tests
         working-directory: ./relic
         run: |
-          # Thay bằng lệnh test thật của bạn, ví dụ:
-          # pytest tests/
-          # hoặc: python -m unittest discover
           echo "Chạy test ở đây"
 
       - name: Run build/smoke check
         working-directory: ./relic
         run: |
-          # Ví dụ: python main.py --dry-run
           echo "Build check ở đây"
