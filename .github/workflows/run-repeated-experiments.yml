@@ -1,0 +1,230 @@
+name: SB - Repeated RELIC/DCOP experiments
+
+run-name: >-
+  ${{ inputs.framework }} / ${{ inputs.problem }} /
+  ${{ inputs.run_count }} runs from seed ${{ inputs.start_seed }}
+
+# Runs a framework several times over consecutive seeds and aggregates the
+# mean/std of the test metric, mirroring the RELIC repo's
+# run-repeated-experiments.yml but driven from SB. The private RELIC repo is
+# checked out into ./relic and everything runs there.
+#
+#  * DSA / LSGA -> decentralized classical baselines (dcop_* only). Each seed
+#    is a separate solver RNG seed; the dataset instances are unchanged.
+#  * RELIC / HiFo / MOTIF -> LLM-driven; each seed is an independent run.
+#
+# One result folder is produced per seed; scripts/aggregate_repeated_results.py
+# then computes mean/std across them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      framework:
+        description: Framework to train and evaluate
+        required: true
+        default: LSGA
+        type: choice
+        options:
+          - RELIC
+          - HiFo
+          - MOTIF
+          - DSA
+          - LSGA
+      problem:
+        description: Problem to train and evaluate
+        required: true
+        default: dcop_gc
+        type: choice
+        options:
+          - dcop_gc
+          - dcop_ms
+          - dcop_sn
+          - dcop_shds
+          - mapp_pc
+          - mapp_ar
+          - mapp_ds
+          - mas_fs
+          - mas_jd
+          - mas_st
+          - co_hmtsp
+          - co_fstsp
+          - co_fjagv
+          - co_mrcps
+      run_count:
+        description: Number of independent runs (1-50)
+        required: true
+        default: "5"
+        type: string
+      start_seed:
+        description: Seed used by the first run
+        required: true
+        default: "0"
+        type: string
+
+concurrency:
+  group: sb-repeated-${{ inputs.framework }}-${{ inputs.problem }}
+  cancel-in-progress: false
+
+jobs:
+  repeated:
+    name: ${{ inputs.framework }} x${{ inputs.run_count }} on ${{ inputs.problem }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+
+    steps:
+      - name: Checkout SB repo
+        uses: actions/checkout@v4
+
+      - name: Checkout private RELIC repo
+        uses: actions/checkout@v4
+        with:
+          repository: Pham2004/RELIC
+          token: ${{ secrets.RELIC_TOKEN }}
+          path: relic
+          ref: main
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: ./relic
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify OpenAI secret
+        if: inputs.framework == 'RELIC' || inputs.framework == 'HiFo' || inputs.framework == 'MOTIF'
+        shell: bash
+        run: |
+          if [[ -z "${{ secrets.OPENAI_API_KEY }}" ]]; then
+            echo "::error::Repository secret OPENAI_API_KEY is not configured."
+            exit 1
+          fi
+
+      - name: Run repeated experiments
+        id: run
+        working-directory: ./relic
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          FRAMEWORK="${{ inputs.framework }}"
+          PROBLEM="${{ inputs.problem }}"
+          RUN_COUNT="${{ inputs.run_count }}"
+          START_SEED="${{ inputs.start_seed }}"
+
+          # ---- validate inputs -------------------------------------------
+          if ! [[ "${RUN_COUNT}" =~ ^[0-9]+$ ]] || (( RUN_COUNT < 1 || RUN_COUNT > 50 )); then
+            echo "::error::run_count must be an integer from 1 to 50."
+            exit 2
+          fi
+          if ! [[ "${START_SEED}" =~ ^[0-9]+$ ]]; then
+            echo "::error::start_seed must be a non-negative integer."
+            exit 2
+          fi
+
+          case "${FRAMEWORK}" in
+            RELIC) METHOD_ID="relic" ;;
+            HiFo)  METHOD_ID="hifo" ;;
+            MOTIF) METHOD_ID="motif" ;;
+            DSA)   METHOD_ID="dsa" ;;
+            LSGA)  METHOD_ID="lsga" ;;
+            *)
+              echo "::error::Unsupported framework: ${FRAMEWORK}"
+              exit 2
+              ;;
+          esac
+          echo "method_id=${METHOD_ID}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${METHOD_ID}" == "dsa" || "${METHOD_ID}" == "lsga" ]]; then
+            case "${PROBLEM}" in
+              dcop_gc|dcop_ms|dcop_sn|dcop_shds) ;;
+              *)
+                echo "::error::${FRAMEWORK} supports only dcop_gc/dcop_ms/dcop_sn/dcop_shds."
+                exit 2
+                ;;
+            esac
+          fi
+
+          RESULT_ROOT="repeated_results"
+          END_SEED=$((START_SEED + RUN_COUNT - 1))
+          echo "Framework : ${FRAMEWORK} (${METHOD_ID})"
+          echo "Problem   : ${PROBLEM}"
+          echo "Seeds     : ${START_SEED}..${END_SEED}  (${RUN_COUNT} runs)"
+
+          # ---- one run per seed ------------------------------------------
+          for SEED in $(seq "${START_SEED}" "${END_SEED}"); do
+            RUN_ID="repeat-${GITHUB_RUN_ID}-s${SEED}"
+            RESULT_PATH="${RESULT_ROOT}/${METHOD_ID}/results/${PROBLEM}/${RUN_ID}"
+            echo "======================================================"
+            echo "Run seed ${SEED}  ->  ${RESULT_PATH}"
+            echo "======================================================"
+
+            if [[ "${METHOD_ID}" == "dsa" || "${METHOD_ID}" == "lsga" ]]; then
+              python -u -m baselines.classical_dcop.run \
+                --method "${METHOD_ID}" \
+                --problem "${PROBLEM}" \
+                --algorithm-seed "${SEED}" \
+                --repetitions 1 \
+                --run-id "${RUN_ID}" \
+                --output-root "${RESULT_ROOT}"
+              test -f "${RESULT_PATH}/summary.json"
+            elif [[ "${METHOD_ID}" == "relic" ]]; then
+              python -u main.py \
+                problem="${PROBLEM}" \
+                framework=relic \
+                seed="${SEED}" \
+                path.RESULTS="${RESULT_PATH}"
+              python -u scripts/evaluate_relic_results.py \
+                --problem "${PROBLEM}" \
+                --results-dir "${RESULT_PATH}"
+              test -f "${RESULT_PATH}/test_results.json"
+            else
+              python -u -m baselines.llm_ahd.hydra_run \
+                method="${METHOD_ID}" \
+                problem="${PROBLEM}" \
+                trainer.seed="${SEED}" \
+                output.root="${RESULT_ROOT}" \
+                output.run_id="${RUN_ID}"
+              test -f "${RESULT_PATH}/summary.json"
+            fi
+          done
+
+      - name: Aggregate mean/std across seeds
+        if: always() && steps.run.outputs.method_id != ''
+        working-directory: ./relic
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p aggregate
+          python -u scripts/aggregate_repeated_results.py \
+            --root repeated_results \
+            --method "${{ steps.run.outputs.method_id }}" \
+            --problem "${{ inputs.problem }}" \
+            --expected-runs "${{ inputs.run_count }}" \
+            --output-dir aggregate \
+            | tee aggregate/aggregate_console.log
+          cat aggregate/aggregate_summary.md >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload all run results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repeated-runs-${{ steps.run.outputs.method_id }}-${{ inputs.problem }}-${{ github.run_id }}
+          path: relic/repeated_results/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload aggregate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repeated-summary-${{ steps.run.outputs.method_id }}-${{ inputs.problem }}-${{ github.run_id }}
+          path: relic/aggregate/
+          if-no-files-found: warn
+          retention-days: 90
