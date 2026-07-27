@@ -12,16 +12,20 @@ run-name: >-
 # Reflect reads only the adapter's own rollout and is never touched, which
 # makes it the built-in negative control.
 #
+# SCOPE: this workflow trains and evaluates only. It produces one artifact per
+# arm and stops there. Aggregation and figures are done locally:
+#
+#   scripts/collect_comm_metrics.py  ->  results/comm_metrics.csv
+#   scripts/plot_comm_experiment.py  ->  figures/
+#
+# so the control arm does not have to live in the same place as the variants,
+# and figures can be redrawn without re-running anything. The final job prints
+# the exact local commands for the run you just dispatched.
+#
 # Shape: one matrix job per ARM (variant x target_role), each running every
 # seed sequentially. Three runs per job matches the load the existing SB
-# workflows already complete inside 480 minutes; putting a whole stage in one
-# job would not fit.
-#
-# `comm=full` is a strict no-op, so the control arm here is the unmodified
-# protocol. Seeds do NOT need to match between control and variants: seed only
-# controls the Python RNG, while the dominant noise source is LLM sampling at
-# temperature 1.0 with no API-side seed. The report job therefore differences
-# against the mean of all `full` runs (`--pairing pooled`).
+# workflows already complete inside 480 minutes; putting a whole stage into
+# one job would not fit.
 
 on:
   workflow_dispatch:
@@ -44,8 +48,8 @@ on:
           - dcop_shds
       variants:
         description: >-
-          Space-separated comm variants. full mislead nopeer = Stage 1.
-          Drop `full` if controls already exist for this problem.
+          Space-separated comm variants. `full mislead nopeer` = Stage 1.
+          Drop `full` if you already have control runs locally.
         required: true
         default: full mislead nopeer
         type: string
@@ -75,16 +79,6 @@ on:
         required: true
         default: "10"
         type: string
-      test_size:
-        description: Test size the figures are drawn on
-        required: true
-        default: n80
-        type: choice
-        options:
-          - n80
-          - n50
-          - n120
-          - auto
       max_parallel:
         description: Concurrent arms (keep low to stay under LLM rate limits)
         required: true
@@ -132,7 +126,7 @@ jobs:
           # Outputs are written to $GITHUB_OUTPUT directly rather than by
           # redirecting stdout, so ::error:: / ::warning:: annotations stay on
           # stdout where the runner can see them. Redirecting the whole script
-          # would file the annotations into the outputs table instead — and a
+          # would file the annotations into the outputs table instead -- and a
           # warning containing "=" would be parsed there as a bogus output.
           _out = os.environ.get("GITHUB_OUTPUT")
 
@@ -185,6 +179,18 @@ jobs:
                   "::warning::mute with target_role=all collapses to the "
                   "no_lift ablation (nobody sends, so no archive ever fills). "
                   "Run mute on a single role instead."
+              )
+
+          # Every figure is a delta against `full`. This workflow does not
+          # draw them, so a missing control is a reminder rather than an
+          # error -- but it is worth saying before 27 runs go by.
+          if "full" not in variants:
+              print(
+                  "::warning::no `full` arm in this dispatch. The local "
+                  "collect/plot step needs at least two control runs for "
+                  "this problem, so make sure they already exist under "
+                  "results/<problem>/relic/full_none_s*/ or import them "
+                  "with scripts/import_full_runs.py."
               )
 
           # `full` ignores target_role, so it must appear exactly once
@@ -259,8 +265,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           case "${{ needs.plan.outputs.client }}" in
-            openai)   KEY="${OPENAI_API_KEY}";   NAME=OPENAI_API_KEY ;;
-            deepseek) KEY="${DEEPSEEK_API_KEY}"; NAME=DEEPSEEK_API_KEY ;;
+            openai)   KEY="${OPENAI_API_KEY}";    NAME=OPENAI_API_KEY ;;
+            deepseek) KEY="${DEEPSEEK_API_KEY}";  NAME=DEEPSEEK_API_KEY ;;
             qwen)     KEY="${DASHSCOPE_API_KEY}"; NAME=DASHSCOPE_API_KEY ;;
             *) echo "::error::unknown client"; exit 2 ;;
           esac
@@ -275,12 +281,11 @@ jobs:
         run: |
           set -Eeuo pipefail
           # Guards the control arm: if `full` ever stopped being a strict
-          # no-op, every delta in this experiment would be measured against
-          # the wrong baseline.
-          python -m unittest tests.test_comm_variants -v 2>&1 | tail -20
+          # no-op, every delta computed later would be measured against the
+          # wrong baseline, with nothing in the output to reveal it.
+          python -m unittest tests.test_comm_variants 2>&1 | tail -5
 
       - name: Run arm ${{ matrix.arm }}
-        id: run
         working-directory: ./relic
         shell: bash
         env:
@@ -337,116 +342,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: comm-${{ inputs.problem }}-${{ matrix.arm }}
-          path: relic/results/${{ inputs.problem }}
+          # Rooted at relic/results so each artifact expands to
+          # <problem>/relic/<arm>/..., which drops straight into a local
+          # results/ tree with no path rewriting.
+          path: relic/results
           retention-days: 90
           if-no-files-found: warn
 
-  report:
-    name: Collect metrics and draw figures
+  next-steps:
+    name: How to aggregate locally
     needs: [plan, run]
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     steps:
-      - name: Checkout SB repo
-        uses: actions/checkout@v4
-
-      - name: Checkout private RELIC repo
-        uses: actions/checkout@v4
-        with:
-          repository: Pham2004/RELIC
-          token: ${{ secrets.RELIC_TOKEN }}
-          path: relic
-          ref: main
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install dependencies
-        working-directory: ./relic
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Download every arm
-        uses: actions/download-artifact@v4
-        with:
-          pattern: comm-${{ inputs.problem }}-*
-          path: relic/results/${{ inputs.problem }}
-          merge-multiple: true
-
-      - name: Show what arrived
-        working-directory: ./relic
-        shell: bash
-        run: |
-          python3 - "results/${{ inputs.problem }}" <<'PY'
-          import json, sys
-          from pathlib import Path
-
-          root = Path(sys.argv[1])
-          metas = sorted(root.rglob("run_meta.json"))
-          if not metas:
-              print(f"::error::no run_meta.json found under {root}; "
-                    "every arm must have failed before writing results")
-              raise SystemExit(1)
-          rows = []
-          for path in metas:
-              m = json.loads(path.read_text())
-              rows.append((
-                  m.get("variant", "?"), m.get("target_role", "?"),
-                  m.get("seed", -1), m.get("status", "?"),
-              ))
-          for variant, target, seed, status in sorted(rows):
-              print(f"{variant:<9} {target:<5} seed={seed:<3} {status}")
-          print(f"\n{len(rows)} run(s) downloaded")
-          PY
-
-      - name: Collect metrics
-        working-directory: ./relic
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          python -u scripts/collect_comm_metrics.py \
-            --results-root results \
-            --out results/comm_metrics.csv
-          echo "--- head ---"
-          head -5 results/comm_metrics.csv
-
-      - name: Draw figures
-        working-directory: ./relic
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          SIZE_ARG=""
-          if [[ "${{ inputs.test_size }}" != "auto" ]]; then
-            SIZE_ARG="--test-size ${{ inputs.test_size }}"
-          fi
-          ONLY_TARGET=""
-          if [[ "${{ inputs.target_roles }}" == "all" ]]; then
-            ONLY_TARGET="--only-target all"
-          fi
-          # Pooled: seeds need not match between control and variants, and
-          # extra controls improve the noise floor for free.
-          python -u scripts/plot_comm_experiment.py \
-            --csv results/comm_metrics.csv \
-            --outdir figures \
-            --format pdf \
-            --pairing pooled \
-            ${SIZE_ARG} ${ONLY_TARGET} | tee figures_report.txt
-          python -u scripts/plot_comm_experiment.py \
-            --csv results/comm_metrics.csv \
-            --outdir figures_png \
-            --format png \
-            --pairing pooled \
-            ${SIZE_ARG} ${ONLY_TARGET} > /dev/null
-
-      - name: Summary
-        if: always()
-        working-directory: ./relic
+      - name: Write local commands to the run summary
         shell: bash
         run: |
           {
@@ -455,31 +364,44 @@ jobs:
             echo "| setting | value |"
             echo "|---|---|"
             echo "| variants | \`${{ inputs.variants }}\` |"
-            echo "| targets | \`${{ inputs.target_roles }}\` |"
+            echo "| target roles | \`${{ inputs.target_roles }}\` |"
             echo "| seeds | \`${{ inputs.seeds }}\` |"
             echo "| model | ${{ inputs.model }} |"
             echo "| budget/batch | ${{ inputs.budget_per_batch }} |"
+            echo "| arms | ${{ needs.plan.outputs.arm_count }} |"
             echo "| planned runs | ${{ needs.plan.outputs.run_count }} |"
-            echo "| figures drawn on | ${{ inputs.test_size }} |"
             echo
-            if [[ -f figures_report.txt ]]; then
-              echo '```'
-              cat figures_report.txt
-              echo '```'
-            else
-              echo "Figures were not produced — see the Draw figures step."
+            echo "### Aggregate and plot locally"
+            echo
+            echo "Each artifact expands to \`${{ inputs.problem }}/relic/<arm>/\`,"
+            echo "so extracting them all into the RELIC \`results/\` directory"
+            echo "reproduces the layout the collector expects."
+            echo
+            echo '```bash'
+            echo "cd <your RELIC checkout>"
+            echo "gh run download ${{ github.run_id }} --repo ${{ github.repository }} --dir /tmp/comm"
+            echo
+            echo "# each downloaded artifact holds <problem>/relic/<arm>/ at its root"
+            echo "cp -r /tmp/comm/*/. results/"
+            echo
+            echo "python scripts/collect_comm_metrics.py \\"
+            echo "    --results-root results --out results/comm_metrics.csv"
+            echo
+            echo "python scripts/plot_comm_experiment.py \\"
+            echo "    --csv results/comm_metrics.csv --outdir figures \\"
+            echo "    --test-size n80 --pairing pooled"
+            echo '```'
+            echo
+            echo "The collector prints how many runs it labelled. If that is 0,"
+            echo "the artifacts landed at the wrong depth — it needs exactly"
+            echo "\`results/<problem>/relic/<arm>/summary.json\`."
+            echo
+            if [[ "${{ contains(inputs.variants, 'full') }}" != "true" ]]; then
+              echo "> This dispatch had no \`full\` arm, so the control runs must"
+              echo "> already exist locally under"
+              echo "> \`results/${{ inputs.problem }}/relic/full_none_s*/\`."
+              echo "> Two or more are needed before a noise floor can be drawn;"
+              echo "> \`scripts/plot_comm_experiment.py\` exits non-zero and says"
+              echo "> so if none are found."
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
-
-      - name: Upload metrics and figures
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: comm-report-${{ inputs.problem }}
-          path: |
-            relic/results/comm_metrics.csv
-            relic/figures/
-            relic/figures_png/
-            relic/figures_report.txt
-          retention-days: 90
-          if-no-files-found: warn
