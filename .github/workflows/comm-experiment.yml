@@ -1,0 +1,485 @@
+name: SB - Degraded-information experiment
+
+run-name: >-
+  comm / ${{ inputs.problem }} / ${{ inputs.variants }} /
+  targets=${{ inputs.target_roles }} / seeds=${{ inputs.seeds }}
+
+# Runs the cross-role information-degradation experiment described in
+# relic/experiments/comm_run_plan.md.
+#
+# RELIC has exactly three peer-to-peer channels (reveal->Lift, public
+# tree->Bridge, cross-distillation). `configs/comm/*` degrades them; operator
+# Reflect reads only the adapter's own rollout and is never touched, which
+# makes it the built-in negative control.
+#
+# Shape: one matrix job per ARM (variant x target_role), each running every
+# seed sequentially. Three runs per job matches the load the existing SB
+# workflows already complete inside 480 minutes; putting a whole stage in one
+# job would not fit.
+#
+# `comm=full` is a strict no-op, so the control arm here is the unmodified
+# protocol. Seeds do NOT need to match between control and variants: seed only
+# controls the Python RNG, while the dominant noise source is LLM sampling at
+# temperature 1.0 with no API-side seed. The report job therefore differences
+# against the mean of all `full` runs (`--pairing pooled`).
+
+on:
+  workflow_dispatch:
+    inputs:
+      problem:
+        description: Problem to run
+        required: true
+        default: mapp_pc
+        type: choice
+        options:
+          - mapp_pc
+          - mapp_ar
+          - mapp_ds
+          - mas_jd
+          - mas_st
+          - mas_fs
+          - dcop_gc
+          - dcop_ms
+          - dcop_sn
+          - dcop_shds
+      variants:
+        description: >-
+          Space-separated comm variants. full mislead nopeer = Stage 1.
+          Drop `full` if controls already exist for this problem.
+        required: true
+        default: full mislead nopeer
+        type: string
+      target_roles:
+        description: >-
+          Space-separated targets. `all` for Stage 1; `A B C` for the Stage 2
+          role breakdown. Ignored by the `full` arm.
+        required: true
+        default: all
+        type: string
+      seeds:
+        description: Space-separated seeds, one run each
+        required: true
+        default: 0 1 2
+        type: string
+      model:
+        description: LLM model (must be identical for controls and variants)
+        required: true
+        default: gpt-4o-mini
+        type: choice
+        options:
+          - gpt-4o-mini
+          - deepseek-v4-flash
+          - qwen3.6-flash
+      budget_per_batch:
+        description: MCTS budget per company per batch
+        required: true
+        default: "10"
+        type: string
+      test_size:
+        description: Test size the figures are drawn on
+        required: true
+        default: n80
+        type: choice
+        options:
+          - n80
+          - n50
+          - n120
+          - auto
+      max_parallel:
+        description: Concurrent arms (keep low to stay under LLM rate limits)
+        required: true
+        default: "3"
+        type: string
+
+concurrency:
+  group: sb-comm-${{ inputs.problem }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Validate and build arm matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      arm_count: ${{ steps.build.outputs.arm_count }}
+      run_count: ${{ steps.build.outputs.run_count }}
+      max_parallel: ${{ steps.build.outputs.max_parallel }}
+      client: ${{ steps.build.outputs.client }}
+    steps:
+      - name: Build matrix
+        id: build
+        shell: bash
+        env:
+          VARIANTS: ${{ inputs.variants }}
+          TARGET_ROLES: ${{ inputs.target_roles }}
+          SEEDS: ${{ inputs.seeds }}
+          MODEL: ${{ inputs.model }}
+          BUDGET: ${{ inputs.budget_per_batch }}
+          MAX_PARALLEL: ${{ inputs.max_parallel }}
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+
+          KNOWN = {"full","partial","mislead","nopeer","mute","anon","stale","trunc"}
+          ROLES = {"all","A","B","C"}
+          CLIENTS = {
+              "gpt-4o-mini": "openai",
+              "deepseek-v4-flash": "deepseek",
+              "qwen3.6-flash": "qwen",
+          }
+
+          # Outputs are written to $GITHUB_OUTPUT directly rather than by
+          # redirecting stdout, so ::error:: / ::warning:: annotations stay on
+          # stdout where the runner can see them. Redirecting the whole script
+          # would file the annotations into the outputs table instead — and a
+          # warning containing "=" would be parsed there as a bogus output.
+          _out = os.environ.get("GITHUB_OUTPUT")
+
+          def emit(key, value):
+              line = f"{key}={value}"
+              if _out:
+                  with open(_out, "a", encoding="utf-8") as handle:
+                      handle.write(line + "\n")
+              else:
+                  print(line)
+
+          def die(msg):
+              print(f"::error::{msg}")
+              sys.exit(2)
+
+          variants = os.environ["VARIANTS"].split()
+          targets = os.environ["TARGET_ROLES"].split()
+          seeds = os.environ["SEEDS"].split()
+
+          if not variants:
+              die("variants must not be empty")
+          unknown = sorted(set(variants) - KNOWN)
+          if unknown:
+              die(f"unknown variant(s) {unknown}; expected from {sorted(KNOWN)}")
+          if not targets:
+              die("target_roles must not be empty")
+          bad = sorted(set(targets) - ROLES)
+          if bad:
+              die(f"unknown target_role(s) {bad}; expected from {sorted(ROLES)}")
+          if not seeds:
+              die("seeds must not be empty")
+          for s in seeds:
+              if not s.isdigit():
+                  die(f"seed {s!r} is not a non-negative integer")
+          if len(set(seeds)) != len(seeds):
+              die(f"seeds must be distinct, got {seeds}")
+
+          budget = os.environ["BUDGET"]
+          if not budget.isdigit() or int(budget) < 1:
+              die("budget_per_batch must be a positive integer")
+          mp = os.environ["MAX_PARALLEL"]
+          if not mp.isdigit() or not 1 <= int(mp) <= 20:
+              die("max_parallel must be an integer from 1 to 20")
+
+          # `mute` with target_role=all leaves nobody sending, so operator L
+          # is unavailable to everyone -- that is the `no_lift` component
+          # ablation, not a new information condition.
+          if "mute" in variants and "all" in targets:
+              print(
+                  "::warning::mute with target_role=all collapses to the "
+                  "no_lift ablation (nobody sends, so no archive ever fills). "
+                  "Run mute on a single role instead."
+              )
+
+          # `full` ignores target_role, so it must appear exactly once
+          # regardless of how many targets were requested.
+          arms = []
+          for variant in variants:
+              for target in (["none"] if variant == "full" else targets):
+                  arms.append({
+                      "variant": variant,
+                      "target": target,
+                      "arm": f"{variant}-{target}",
+                  })
+
+          emit("matrix", json.dumps({"include": arms}, separators=(",", ":")))
+          emit("arm_count", len(arms))
+          emit("run_count", len(arms) * len(seeds))
+          emit("max_parallel", mp)
+          emit("client", CLIENTS[os.environ["MODEL"]])
+          PY
+
+      - name: Show plan
+        shell: bash
+        run: |
+          echo "Problem      : ${{ inputs.problem }}"
+          echo "Arms         : ${{ steps.build.outputs.arm_count }}"
+          echo "Seeds        : ${{ inputs.seeds }}"
+          echo "Total runs   : ${{ steps.build.outputs.run_count }}"
+          echo "Model/client : ${{ inputs.model }} / ${{ steps.build.outputs.client }}"
+          echo "Budget       : ${{ inputs.budget_per_batch }} per company per batch"
+          echo "Matrix       : ${{ steps.build.outputs.matrix }}"
+
+  run:
+    name: ${{ matrix.arm }} on ${{ inputs.problem }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - name: Checkout SB repo
+        uses: actions/checkout@v4
+
+      - name: Checkout private RELIC repo
+        uses: actions/checkout@v4
+        with:
+          repository: Pham2004/RELIC
+          token: ${{ secrets.RELIC_TOKEN }}
+          path: relic
+          ref: main
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: ./relic
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify the LLM secret for this client
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+        run: |
+          set -Eeuo pipefail
+          case "${{ needs.plan.outputs.client }}" in
+            openai)   KEY="${OPENAI_API_KEY}";   NAME=OPENAI_API_KEY ;;
+            deepseek) KEY="${DEEPSEEK_API_KEY}"; NAME=DEEPSEEK_API_KEY ;;
+            qwen)     KEY="${DASHSCOPE_API_KEY}"; NAME=DASHSCOPE_API_KEY ;;
+            *) echo "::error::unknown client"; exit 2 ;;
+          esac
+          if [[ -z "${KEY}" ]]; then
+            echo "::error::Repository secret ${NAME} is not configured."
+            exit 1
+          fi
+
+      - name: Confirm comm=full is still a no-op
+        working-directory: ./relic
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Guards the control arm: if `full` ever stopped being a strict
+          # no-op, every delta in this experiment would be measured against
+          # the wrong baseline.
+          python -m unittest tests.test_comm_variants -v 2>&1 | tail -20
+
+      - name: Run arm ${{ matrix.arm }}
+        id: run
+        working-directory: ./relic
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+        run: |
+          set -Eeuo pipefail
+          # --continue-on-error so one bad seed does not cost the other two;
+          # the driver still exits non-zero, so the job fails visibly.
+          python -u scripts/run_comm_experiment.py \
+            --problem "${{ inputs.problem }}" \
+            --variants "${{ matrix.variant }}" \
+            --target-roles "${{ matrix.target }}" \
+            --seeds ${{ inputs.seeds }} \
+            --client "${{ needs.plan.outputs.client }}" \
+            --model "${{ inputs.model }}" \
+            --budget "${{ inputs.budget_per_batch }}" \
+            --skip-existing \
+            --continue-on-error
+
+      - name: Report which runs completed
+        if: always()
+        working-directory: ./relic
+        shell: bash
+        run: |
+          python3 - "results/${{ inputs.problem }}/relic" <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          if not root.is_dir():
+              print(f"::warning::no result directory at {root}")
+              raise SystemExit(0)
+
+          def field(path, key, default="-"):
+              try:
+                  return json.loads(path.read_text()).get(key, default)
+              except Exception:
+                  return default
+
+          for run_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+              done = (run_dir / "test_results.json").is_file()
+              print(
+                  f"{run_dir.name}: "
+                  f"{'complete' if done else 'INCOMPLETE'}  "
+                  f"iterations={field(run_dir / 'summary.json', 'total_iterations')}  "
+                  f"wall_seconds={field(run_dir / 'run_meta.json', 'wall_seconds')}"
+              )
+          PY
+
+      - name: Upload arm results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: comm-${{ inputs.problem }}-${{ matrix.arm }}
+          path: relic/results/${{ inputs.problem }}
+          retention-days: 90
+          if-no-files-found: warn
+
+  report:
+    name: Collect metrics and draw figures
+    needs: [plan, run]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout SB repo
+        uses: actions/checkout@v4
+
+      - name: Checkout private RELIC repo
+        uses: actions/checkout@v4
+        with:
+          repository: Pham2004/RELIC
+          token: ${{ secrets.RELIC_TOKEN }}
+          path: relic
+          ref: main
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: ./relic
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download every arm
+        uses: actions/download-artifact@v4
+        with:
+          pattern: comm-${{ inputs.problem }}-*
+          path: relic/results/${{ inputs.problem }}
+          merge-multiple: true
+
+      - name: Show what arrived
+        working-directory: ./relic
+        shell: bash
+        run: |
+          python3 - "results/${{ inputs.problem }}" <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          metas = sorted(root.rglob("run_meta.json"))
+          if not metas:
+              print(f"::error::no run_meta.json found under {root}; "
+                    "every arm must have failed before writing results")
+              raise SystemExit(1)
+          rows = []
+          for path in metas:
+              m = json.loads(path.read_text())
+              rows.append((
+                  m.get("variant", "?"), m.get("target_role", "?"),
+                  m.get("seed", -1), m.get("status", "?"),
+              ))
+          for variant, target, seed, status in sorted(rows):
+              print(f"{variant:<9} {target:<5} seed={seed:<3} {status}")
+          print(f"\n{len(rows)} run(s) downloaded")
+          PY
+
+      - name: Collect metrics
+        working-directory: ./relic
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -u scripts/collect_comm_metrics.py \
+            --results-root results \
+            --out results/comm_metrics.csv
+          echo "--- head ---"
+          head -5 results/comm_metrics.csv
+
+      - name: Draw figures
+        working-directory: ./relic
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SIZE_ARG=""
+          if [[ "${{ inputs.test_size }}" != "auto" ]]; then
+            SIZE_ARG="--test-size ${{ inputs.test_size }}"
+          fi
+          ONLY_TARGET=""
+          if [[ "${{ inputs.target_roles }}" == "all" ]]; then
+            ONLY_TARGET="--only-target all"
+          fi
+          # Pooled: seeds need not match between control and variants, and
+          # extra controls improve the noise floor for free.
+          python -u scripts/plot_comm_experiment.py \
+            --csv results/comm_metrics.csv \
+            --outdir figures \
+            --format pdf \
+            --pairing pooled \
+            ${SIZE_ARG} ${ONLY_TARGET} | tee figures_report.txt
+          python -u scripts/plot_comm_experiment.py \
+            --csv results/comm_metrics.csv \
+            --outdir figures_png \
+            --format png \
+            --pairing pooled \
+            ${SIZE_ARG} ${ONLY_TARGET} > /dev/null
+
+      - name: Summary
+        if: always()
+        working-directory: ./relic
+        shell: bash
+        run: |
+          {
+            echo "## Degraded-information experiment — ${{ inputs.problem }}"
+            echo
+            echo "| setting | value |"
+            echo "|---|---|"
+            echo "| variants | \`${{ inputs.variants }}\` |"
+            echo "| targets | \`${{ inputs.target_roles }}\` |"
+            echo "| seeds | \`${{ inputs.seeds }}\` |"
+            echo "| model | ${{ inputs.model }} |"
+            echo "| budget/batch | ${{ inputs.budget_per_batch }} |"
+            echo "| planned runs | ${{ needs.plan.outputs.run_count }} |"
+            echo "| figures drawn on | ${{ inputs.test_size }} |"
+            echo
+            if [[ -f figures_report.txt ]]; then
+              echo '```'
+              cat figures_report.txt
+              echo '```'
+            else
+              echo "Figures were not produced — see the Draw figures step."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload metrics and figures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: comm-report-${{ inputs.problem }}
+          path: |
+            relic/results/comm_metrics.csv
+            relic/figures/
+            relic/figures_png/
+            relic/figures_report.txt
+          retention-days: 90
+          if-no-files-found: warn
